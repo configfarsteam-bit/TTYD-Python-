@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-Download, verify, install, and optionally run ttyd safely.
-
-این اسکریپت به root نیاز دارد، چون به‌صورت پیش‌فرض در
-/usr/local/bin نصب می‌کند و در حالت اجرا یک shell با دسترسی root باز می‌کند.
-"""
 
 from __future__ import annotations
 
@@ -29,7 +23,10 @@ from pathlib import Path
 VERSION = os.environ.get("TTYD_VERSION", "1.7.7").strip()
 
 INSTALL_DIR = Path(
-    os.environ.get("TTYD_INSTALL_DIR", "/usr/local/bin")
+    os.environ.get(
+        "TTYD_INSTALL_DIR",
+        str(Path.home() / ".local" / "bin"),
+    )
 ).expanduser()
 
 TTYD_PATH = INSTALL_DIR / "ttyd"
@@ -41,7 +38,7 @@ BASE_URL = os.environ.get(
 
 PORT = os.environ.get("TTYD_PORT", "7681").strip()
 
-# پیش‌فرض فقط روی localhost گوش می‌دهد.
+# پیش‌فرض فقط روی همین سیستم قابل دسترسی است.
 # برای دسترسی شبکه:
 # TTYD_BIND=0.0.0.0
 BIND = os.environ.get("TTYD_BIND", "127.0.0.1").strip()
@@ -49,16 +46,19 @@ BIND = os.environ.get("TTYD_BIND", "127.0.0.1").strip()
 USERNAME = os.environ.get("TTYD_USER", "admin")
 PASSWORD = os.environ.get("TTYD_PASSWORD")
 
-# در حالت تست، ttyd اجرا نمی‌شود.
-NO_START = os.environ.get("TTYD_NO_START") == "1"
+# مقدار 1 یعنی فقط نصب و تست، بدون اجرای ttyd
+NO_START = os.environ.get("TTYD_NO_START", "0") == "1"
 
-# جلوگیری از دانلود فایل غیرعادی بزرگ
-MAX_DOWNLOAD_BYTES = int(
-    os.environ.get(
-        "TTYD_MAX_DOWNLOAD_BYTES",
-        str(100 * 1024 * 1024),
+# حداکثر اندازه فایل دانلودی
+try:
+    MAX_DOWNLOAD_BYTES = int(
+        os.environ.get(
+            "TTYD_MAX_DOWNLOAD_BYTES",
+            str(100 * 1024 * 1024),
+        )
     )
-)
+except ValueError:
+    MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 
 
 # =========================================================
@@ -95,30 +95,18 @@ ARCH_MAP = {
 # =========================================================
 
 def die(message: str, code: int = 1) -> None:
-    """چاپ خطا و خروج از برنامه."""
+    """نمایش خطا و خروج."""
     print(f"[!] {message}", file=sys.stderr)
     raise SystemExit(code)
 
 
-def require_root() -> None:
-    """بررسی اجرای اسکریپت با دسترسی root."""
-    if not hasattr(os, "geteuid"):
-        die("این اسکریپت برای Linux/Unix طراحی شده است.")
-
-    if os.geteuid() != 0:
-        script_path = os.path.abspath(__file__)
-
-        die(
-            "این اسکریپت باید با root اجرا شود.
-"
-            f"مثال: sudo python3 {script_path}"
-        )
-
-
 def validate_config() -> None:
-    """اعتبارسنجی تنظیمات محیطی."""
+    """بررسی تنظیمات ورودی."""
 
-    if not VERSION or any(char in VERSION for char in "\r
+    if not VERSION:
+        die("TTYD_VERSION نمی‌تواند خالی باشد.")
+
+    if any(char in VERSION for char in "\r
 "):
         die("TTYD_VERSION نامعتبر است.")
 
@@ -135,6 +123,13 @@ def validate_config() -> None:
     if not 1 <= port <= 65535:
         die("TTYD_PORT باید بین 1 و 65535 باشد.")
 
+    if not BIND:
+        die("TTYD_BIND نمی‌تواند خالی باشد.")
+
+    if any(char in BIND for char in "\r
+"):
+        die("TTYD_BIND نامعتبر است.")
+
     if not USERNAME:
         die("TTYD_USER نمی‌تواند خالی باشد.")
 
@@ -146,7 +141,9 @@ def validate_config() -> None:
 
     if PASSWORD is not None:
         if not PASSWORD:
-            die("TTYD_PASSWORD نمی‌تواند خالی باشد.")
+            die(
+                "TTYD_PASSWORD نمی‌تواند خالی باشد."
+            )
 
         if any(char in PASSWORD for char in "\r
 "):
@@ -154,24 +151,18 @@ def validate_config() -> None:
                 "TTYD_PASSWORD نباید شامل خط جدید باشد."
             )
 
-    if not BIND:
-        die("TTYD_BIND نمی‌تواند خالی باشد.")
-
-    if any(char in BIND for char in "\r
-"):
-        die("TTYD_BIND نامعتبر است.")
-
     if MAX_DOWNLOAD_BYTES < 4096:
         die(
             "TTYD_MAX_DOWNLOAD_BYTES باید حداقل 4096 باشد."
         )
 
-    if INSTALL_DIR == Path("/") or TTYD_PATH == Path("/"):
-        die("مسیر نصب نامعتبر است.")
+    if INSTALL_DIR == Path("/"):
+        die("TTYD_INSTALL_DIR نامعتبر است.")
 
 
 def detect_architecture() -> tuple[str, str]:
-    """تشخیص معماری CPU و نام فایل release."""
+    """تشخیص معماری و نام فایل binary."""
+
     machine = platform.machine().lower()
     asset_arch = ARCH_MAP.get(machine)
 
@@ -189,18 +180,26 @@ def detect_architecture() -> tuple[str, str]:
     return machine, f"ttyd.{asset_arch}"
 
 
-def http_get(url: str, timeout: int = 30) -> bytes:
-    """دانلود داده با کتابخانه استاندارد Python."""
-    request = urllib.request.Request(
+def create_request(url: str) -> urllib.request.Request:
+    """ساخت درخواست HTTP با User-Agent مشخص."""
+
+    return urllib.request.Request(
         url,
         headers={
-            "User-Agent": "ttyd-installer/2.0"
+            "User-Agent": "ttyd-python-installer/3.0"
         },
     )
 
+
+def download_bytes(
+    url: str,
+    timeout: int = 30,
+) -> bytes:
+    """دانلود فایل کوچک مثل SHA256SUMS."""
+
     try:
         with urllib.request.urlopen(
-            request,
+            create_request(url),
             timeout=timeout,
         ) as response:
             data = response.read(
@@ -216,34 +215,28 @@ def http_get(url: str, timeout: int = 30) -> bytes:
 
     if len(data) > MAX_DOWNLOAD_BYTES:
         die(
-            "فایل دریافتی از سقف اندازه مجاز بزرگ‌تر است."
+            "فایل دریافتی از سقف اندازه مجاز "
+            "بزرگ‌تر است."
         )
 
     return data
 
 
 # =========================================================
-# SHA256
+# CHECKSUM
 # =========================================================
 
 def get_official_sha256(asset_name: str) -> str:
-    """دریافت SHA-256 فایل از SHA256SUMS رسمی."""
+    """دریافت checksum رسمی فایل binary."""
+
     sums_url = f"{BASE_URL}/SHA256SUMS"
 
     print(f"[+] دریافت checksum رسمی: {sums_url}")
 
-    try:
-        raw_data = http_get(sums_url)
-
-        data = raw_data.decode(
-            "utf-8",
-            errors="strict",
-        )
-
-    except UnicodeDecodeError as exc:
-        die(
-            f"فایل SHA256SUMS متن UTF-8 معتبر نیست: {exc}"
-        )
+    data = download_bytes(sums_url).decode(
+        "utf-8",
+        errors="strict",
+    )
 
     for raw_line in data.splitlines():
         line = raw_line.strip()
@@ -262,15 +255,19 @@ def get_official_sha256(asset_name: str) -> str:
         if Path(filename).name != asset_name:
             continue
 
-        if (
-            len(digest) != 64
-            or any(
-                char not in string.hexdigits
-                for char in digest
+        if len(digest) != 64:
+            die(
+                f"طول SHA-256 برای {asset_name} "
+                "معتبر نیست."
             )
+
+        if any(
+            char not in string.hexdigits
+            for char in digest
         ):
             die(
-                f"SHA-256 نامعتبر برای {asset_name}"
+                f"SHA-256 برای {asset_name} "
+                "معتبر نیست."
             )
 
         return digest.lower()
@@ -289,13 +286,18 @@ def download_and_install(
     asset_name: str,
     expected_sha256: str,
 ) -> None:
-    """دانلود، بررسی checksum، بررسی ELF و نصب اتمیک."""
+    """دانلود، بررسی، و نصب اتمیک ttyd."""
 
-    INSTALL_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-        mode=0o755,
-    )
+    try:
+        INSTALL_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+            mode=0o755,
+        )
+    except OSError as exc:
+        die(
+            f"ساخت مسیر نصب ناموفق بود: {exc}"
+        )
 
     if not INSTALL_DIR.is_dir():
         die(
@@ -307,26 +309,23 @@ def download_and_install(
             f"مسیر نصب نباید symlink باشد: {INSTALL_DIR}"
         )
 
-    temp_fd, temp_name = tempfile.mkstemp(
-        prefix=".ttyd-",
-        dir=str(INSTALL_DIR),
-    )
+    try:
+        temp_fd, temp_name = tempfile.mkstemp(
+            prefix=".ttyd-",
+            dir=str(INSTALL_DIR),
+        )
+    except OSError as exc:
+        die(
+            f"ساخت فایل موقت ناموفق بود: {exc}"
+        )
 
     os.close(temp_fd)
-
     temp_path = Path(temp_name)
 
     try:
         url = f"{BASE_URL}/{asset_name}"
 
-        print(f"[+] دانلود: {url}")
-
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "ttyd-installer/2.0"
-            },
-        )
+        print(f"[+] دانلود binary: {url}")
 
         sha256 = hashlib.sha256()
         total = 0
@@ -334,7 +333,7 @@ def download_and_install(
         try:
             with (
                 urllib.request.urlopen(
-                    request,
+                    create_request(url),
                     timeout=60,
                 ) as response,
                 temp_path.open("wb") as output,
@@ -366,7 +365,9 @@ def download_and_install(
             TimeoutError,
             OSError,
         ) as exc:
-            die(f"دانلود ttyd ناموفق بود: {exc}")
+            die(
+                f"دانلود ttyd ناموفق بود: {exc}"
+            )
 
         if total < 4096:
             die(
@@ -407,15 +408,9 @@ def download_and_install(
         # نصب اتمیک
         os.replace(temp_path, TTYD_PATH)
 
-        print(
-            "[+] نصب اتمیک انجام شد:
-"
-            f"    مسیر: {TTYD_PATH}
-"
-            f"    حجم: {total} bytes
-"
-            "    مجوز: 755"
-        )
+        print("[+] نصب با موفقیت انجام شد.")
+        print(f"[+] مسیر binary: {TTYD_PATH}")
+        print(f"[+] اندازه فایل: {total} bytes")
 
     finally:
         try:
@@ -425,13 +420,23 @@ def download_and_install(
 
 
 # =========================================================
-# VERIFY BINARY
+# VERIFY
 # =========================================================
 
 def verify_ttyd() -> None:
-    """اجرای ttyd --version برای بررسی binary."""
+    """بررسی اجرای binary نصب‌شده."""
 
-    print("[+] تست ttyd --version...")
+    print("[+] اجرای ttyd --version...")
+
+    if not TTYD_PATH.exists():
+        die(
+            f"فایل ttyd پیدا نشد: {TTYD_PATH}"
+        )
+
+    if not os.access(TTYD_PATH, os.X_OK):
+        die(
+            f"فایل ttyd قابل اجرا نیست: {TTYD_PATH}"
+        )
 
     try:
         result = subprocess.run(
@@ -449,18 +454,24 @@ def verify_ttyd() -> None:
         OSError,
         subprocess.SubprocessError,
     ) as exc:
-        die(f"اجرای ttyd ناموفق بود: {exc}")
+        die(
+            f"اجرای ttyd ناموفق بود: {exc}"
+        )
 
     output = (
         result.stdout + result.stderr
     ).strip()
 
-    print("[+] خروجی نسخه ttyd:")
-    print(output or "(بدون خروجی)")
+    print("[+] خروجی نسخه:")
+
+    if output:
+        print(output)
+    else:
+        print("(بدون خروجی)")
 
     if result.returncode != 0:
         die(
-            "اجرای ttyd --version با خطا تمام شد."
+            "ttyd --version با خطا تمام شد."
         )
 
     if "ttyd" not in output.lower():
@@ -474,7 +485,7 @@ def verify_ttyd() -> None:
 # =========================================================
 
 def create_password() -> str:
-    """استفاده از رمز محیطی یا ساخت رمز تصادفی امن."""
+    """دریافت رمز از محیط یا تولید رمز تصادفی."""
 
     if PASSWORD is not None:
         return PASSWORD
@@ -493,8 +504,19 @@ def create_password() -> str:
 # START
 # =========================================================
 
-def start_ttyd(password: str) -> None:
-    """اجرای ttyd با shell."""
+def get_shell() -> str:
+    """پیدا کردن shell کاربر فعلی."""
+
+    configured_shell = os.environ.get("SHELL")
+
+    if configured_shell:
+        configured_path = Path(configured_shell)
+
+        if configured_path.is_file() and os.access(
+            configured_path,
+            os.X_OK,
+        ):
+            return str(configured_path)
 
     shell = (
         shutil.which("bash")
@@ -506,24 +528,37 @@ def start_ttyd(password: str) -> None:
             "bash یا sh روی سیستم پیدا نشد."
         )
 
-    if os.geteuid() != 0:
+    return shell
+
+
+def start_ttyd(password: str) -> None:
+    """اجرای ttyd با کاربر فعلی."""
+
+    shell = get_shell()
+
+    current_user = os.environ.get(
+        "USER",
+        "current-user",
+    )
+
+    current_home = Path.home()
+
+    if not current_home.is_dir():
         die(
-            "ttyd با root اجرا نمی‌شود."
+            f"Home directory پیدا نشد: {current_home}"
         )
 
     print()
     print("=" * 40)
-    print(" ttyd ROOT TERMINAL")
+    print(" ttyd USER TERMINAL")
     print("=" * 40)
     print()
     print(f"Address : {BIND}:{PORT}")
     print(f"User    : {USERNAME}")
-    print(f"UID     : {os.geteuid()}")
+    print(f"OS user : {current_user}")
+    print(f"Workdir : {current_home}")
     print()
 
-    # توجه:
-    # ttyd در این نسخه رمز را از طریق argv دریافت می‌کند.
-    # بنابراین ممکن است رمز در process list قابل مشاهده باشد.
     command = [
         str(TTYD_PATH),
         "--port",
@@ -534,13 +569,18 @@ def start_ttyd(password: str) -> None:
         "--credential",
         f"{USERNAME}:{password}",
         "--cwd",
-        "/root",
+        str(current_home),
         shell,
     ]
 
     print("[+] اجرای ttyd...")
+    print(
+        "[!] برای توقف، Ctrl+C یا ترمینال را ببند."
+    )
 
-    # جایگزینی پردازش Python با ttyd
+    # توجه:
+    # ttyd نسخه 1.7.7 رمز را از argv می‌گیرد.
+    # بنابراین ممکن است رمز در process list دیده شود.
     os.execv(
         str(TTYD_PATH),
         command,
@@ -555,11 +595,10 @@ def main() -> None:
     print()
     print("=" * 40)
     print(" ttyd Python Installer")
-    print(" No external Python packages")
+    print(" Non-root compatible")
     print("=" * 40)
     print()
 
-    require_root()
     validate_config()
 
     machine, asset_name = detect_architecture()
@@ -574,8 +613,7 @@ def main() -> None:
         asset_name
     )
 
-    print("[+] Official SHA-256:")
-    print(f"    {expected_sha256}")
+    print(f"[+] Official SHA-256: {expected_sha256}")
     print()
 
     download_and_install(
@@ -589,13 +627,29 @@ def main() -> None:
     print()
 
     if NO_START:
-        print("[+] حالت تست فعال است.")
-        print("[+] ttyd اجرا نشد.")
+        print(
+            "[+] TTYD_NO_START=1 فعال است."
+        )
+        print(
+            "[+] ttyd نصب و تست شد، اما اجرا نشد."
+        )
         return
 
     password = create_password()
+
+    print(
+        "[!] اگر رمز را با TTYD_PASSWORD تعیین نکرده‌ای، "
+        "رمز تولیدشده را پایین ببین:"
+    )
+    print(f"[+] Password: {password}")
+
     start_ttyd(password)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("
+[+] عملیات توسط کاربر متوقف شد.")
+        sys.exit(130)
